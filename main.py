@@ -195,92 +195,6 @@ async def interpret_command_with_llm(command, history=None):
     else:
         return await call_openai_api(command, history=history)
 
-
-# --- Device Control Functions ---
-# ... (set_brightness, toggle_wifi, toggle_bluetooth, get_cpu_usage, get_memory_usage, set_volume, get_volume, get_battery_status remain unchanged) ...
-def set_brightness(level): return f"Brightness set to {level}%"
-def toggle_wifi(state): return f"Wi-Fi toggled {state}"
-def toggle_bluetooth(state): return f"Bluetooth toggled {state}"
-def get_cpu_usage():
-    if psutil: return f"CPU Usage: {psutil.cpu_percent(interval=0.1)}%"
-    return "Error: psutil library missing."
-def get_memory_usage():
-    if psutil: return f"Memory Usage: {psutil.virtual_memory().percent:.1f}%"
-    return "Error: psutil library missing."
-async def set_volume(level): return f"Volume set to {level}%"
-async def get_volume(): return f"Current Volume: 50%" # Placeholder
-def get_battery_status():
-    if psutil:
-        battery = psutil.sensors_battery()
-        if battery: return json.dumps({"percent": int(battery.percent), "charging": battery.power_plugged, "status_text": f"Battery: {int(battery.percent)}% ({'Charging' if battery.power_plugged else 'Discharging'})"})
-        else: return json.dumps({"error": "No battery detected."})
-    return json.dumps({"error": "psutil library missing."})
-
-
-# --- Shell Command Executor (Updated success check) ---
-def execute_shell_command(command):
-    """
-    Executes a shell command string and captures output. Returns structured dict.
-    Success requires exit code 0 AND empty stderr.
-    🛑 SECURITY WARNING: Only use if ALLOW_SHELL_EXECUTION is true.
-    """
-    result_data = {
-        "command": command,
-        "success": False,
-        "exit_code": -1,
-        "stdout": "",
-        "stderr": "",
-        "error_message": None
-    }
-    if not ALLOW_SHELL_EXECUTION:
-        logging.warning(f"Blocked attempt to execute shell command (disabled): {command}")
-        result_data["error_message"] = "Shell command execution is disabled by server configuration."
-        return result_data
-
-    logging.warning(f"🛑 EXECUTING SHELL COMMAND: {command}")
-    try:
-        result = subprocess.run(
-            command,
-            shell=True, # Necessary for complex commands, increases risk
-            capture_output=True,
-            text=True,
-            timeout=SHELL_COMMAND_TIMEOUT,
-            check=False
-        )
-        result_data["exit_code"] = result.returncode
-        result_data["stdout"] = result.stdout.strip() if result.stdout else ""
-        result_data["stderr"] = result.stderr.strip() if result.stderr else ""
-        # --- MODIFIED SUCCESS CHECK ---
-        # Success only if exit code is 0 AND stderr is empty
-        result_data["success"] = (result.returncode == 0 and not result.stderr)
-
-        if result_data["success"]:
-             logging.info(f"Shell command executed successfully. Exit Code: 0, Stderr: (empty)")
-        else:
-             logging.warning(f"Shell command failed. Success Criteria Failed (Exit Code: {result.returncode}, Stderr: '{result.stderr[:100]}...')") # Log snippet of stderr
-
-        return result_data
-
-    except subprocess.TimeoutExpired:
-        logging.error(f"Shell command timed out: {command}")
-        result_data["error_message"] = f"Command timed out after {SHELL_COMMAND_TIMEOUT} seconds."
-        result_data["success"] = False # Ensure success is false on timeout
-        return result_data
-    except Exception as e:
-        logging.exception(f"Error executing shell command '{command}': {e}")
-        result_data["error_message"] = f"Error executing shell command: {e}"
-        result_data["success"] = False # Ensure success is false on other exceptions
-        return result_data
-
-
-# --- Intent to Function Mapping (Unchanged) ---
-INTENT_HANDLERS = {
-    "set_brightness": set_brightness, "toggle_wifi": toggle_wifi, "toggle_bluetooth": toggle_bluetooth,
-    "get_cpu_usage": get_cpu_usage, "get_memory_usage": get_memory_usage,
-    "set_volume": set_volume, "get_volume": get_volume, "get_battery_status": get_battery_status,
-    "run_shell_command": execute_shell_command,
-}
-
 # --- WebSocket Handler (Unchanged) ---
 async def handler(websocket):
     logging.info(f"Client connected from {websocket.remote_address}")
@@ -349,6 +263,415 @@ async def main():
     logging.info(f"Starting WebSocket server on ws://{HOST}:{PORT}")
     async with websockets.serve(handler, HOST, PORT, ping_interval=20, ping_timeout=20):
         await asyncio.Future()
+
+import sys
+import subprocess
+import json
+import asyncio
+import platform  # Use platform module for better OS detection
+
+# --- Attempt to import libraries ---
+try:
+    import psutil
+except ImportError:
+    psutil = None
+    print("Warning: psutil library not found. CPU, Memory, and Battery functions will not work.")
+
+try:
+    import screen_brightness_control as sbc
+except ImportError:
+    sbc = None
+    print("Warning: screen-brightness-control library not found. Brightness function will not work.")
+
+# Windows-specific import for volume
+if sys.platform == 'win32':
+    try:
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from comtypes import CLSCTX_ALL
+    except ImportError:
+        AudioUtilities = None
+        print("Warning: pycaw library not found. Windows volume control will not work.")
+else:
+     AudioUtilities = None # Define as None for other platforms
+
+# --- Helper function for running subprocess commands ---
+async def _run_command(command):
+    """Asynchronously runs a shell command."""
+    process = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        print(f"Error running command '{command}': {stderr.decode().strip()}")
+        return None
+    return stdout.decode().strip()
+
+# --- Device Control Functions ---
+
+def set_brightness(level: int) -> str:
+    """Sets the screen brightness.
+
+    Args:
+        level: Brightness level percentage (0-100).
+
+    Returns:
+        Status message or error.
+    """
+    if not sbc:
+        return "Error: screen-brightness-control library missing."
+    if not 0 <= level <= 100:
+        return "Error: Brightness level must be between 0 and 100."
+    try:
+        sbc.set_brightness(level)
+        return f"Brightness set to {level}%"
+    except Exception as e:
+        return f"Error setting brightness: {e}"
+
+async def toggle_wifi(state: str) -> str:
+    """Toggles Wi-Fi state (on/off). Highly platform-dependent.
+
+    Args:
+        state: 'on' or 'off'.
+
+    Returns:
+        Status message or error. Requires appropriate permissions.
+    """
+    command = None
+    adapter_name = "Wi-Fi" # Common adapter name, might need adjustment
+
+    if state not in ['on', 'off']:
+        return "Error: State must be 'on' or 'off'."
+
+    action = 'enable' if state == 'on' else 'disable'
+
+    try:
+        if sys.platform == 'win32':
+            # Requires admin privileges
+            command = f'netsh interface set interface name="{adapter_name}" admin={action}'
+            result = await _run_command(command)
+            if result is not None:
+                 return f"Wi-Fi toggled {state} (requires admin privileges)."
+            else:
+                 return f"Error toggling Wi-Fi on Windows. Command: '{command}'. Check adapter name and permissions."
+
+        elif sys.platform == 'darwin': # macOS
+            # May require specific permissions or user interaction
+            device_id = await _run_command("networksetup -listallhardwareports | awk '/Hardware Port: Wi-Fi/{getline; print $2}'")
+            if not device_id:
+                 return "Error: Could not determine Wi-Fi device ID on macOS."
+            command = f'networksetup -setairportpower {device_id} {state}'
+            result = await _run_command(command)
+            if result is not None:
+                 return f"Wi-Fi toggled {state} on macOS."
+            else:
+                 return f"Error toggling Wi-Fi on macOS. Command: '{command}'. Check permissions."
+
+        elif sys.platform.startswith('linux'):
+            # Requires nmcli (NetworkManager) to be installed and running
+            command = f'nmcli radio wifi {state}'
+            result = await _run_command(command)
+            if result is not None:
+                 return f"Wi-Fi toggled {state} via nmcli on Linux."
+            else:
+                return f"Error toggling Wi-Fi on Linux. Command: '{command}'. Is NetworkManager running?"
+        else:
+            return f"Error: Wi-Fi toggle not supported on this platform ({sys.platform})."
+    except Exception as e:
+        return f"An unexpected error occurred toggling Wi-Fi: {e}"
+
+
+async def toggle_bluetooth(state: str) -> str:
+    """Toggles Bluetooth state (on/off). Highly platform-dependent.
+
+    Args:
+        state: 'on' or 'off'.
+
+    Returns:
+        Status message or error. Requires appropriate permissions/tools.
+    """
+    # Bluetooth control is even more complex and less standardized than Wi-Fi.
+    # Often requires specific tools (e.g., blueutil on macOS, rfkill/bluetoothctl on Linux)
+    # or interacting with platform-specific APIs/services.
+    # Providing a robust cross-platform implementation here is difficult.
+    # Placeholder implementation:
+    if state not in ['on', 'off']:
+        return "Error: State must be 'on' or 'off'."
+
+    print(f"--- Attempting to toggle Bluetooth {state} ---")
+    if sys.platform == 'darwin':
+        # Requires 'blueutil' (brew install blueutil)
+        try:
+            status_code = subprocess.call(['blueutil', '--power', '1' if state == 'on' else '0'])
+            if status_code == 0:
+                return f"Bluetooth toggled {state} on macOS (using blueutil)."
+            else:
+                return "Error: Failed to toggle Bluetooth using blueutil. Is it installed?"
+        except FileNotFoundError:
+             return "Error: 'blueutil' command not found. Please install it (brew install blueutil)."
+        except Exception as e:
+             return f"Error toggling Bluetooth on macOS: {e}"
+
+    elif sys.platform.startswith('linux'):
+         # Requires 'rfkill' or 'bluetoothctl'. Using rfkill is simpler for basic toggle.
+         # May require user to be in specific groups (e.g., rfkill, bluetooth).
+        try:
+            action = 'unblock' if state == 'on' else 'block'
+            command = f'rfkill {action} bluetooth'
+            result = await _run_command(command)
+            # rfkill might not produce stdout on success, check return code implicitly via _run_command
+            if result is not None: # Check if command ran without error reported by _run_command
+                 # Check status after command
+                 status_output = await _run_command("rfkill list bluetooth -n -o SOFT")
+                 current_state = "on" if status_output and "unblocked" in status_output else "off"
+                 if current_state == state:
+                     return f"Bluetooth toggled {state} on Linux (using rfkill)."
+                 else:
+                     # This case might happen if rfkill is blocked by hardware switch
+                     return f"Attempted to toggle Bluetooth {state} using rfkill, but state is still {current_state}. Check hardware switch or permissions."
+            else:
+                 return f"Error toggling Bluetooth on Linux using rfkill. Command: '{command}'. Check permissions/groups."
+
+        except Exception as e:
+            return f"Error toggling Bluetooth on Linux: {e}"
+
+    elif sys.platform == 'win32':
+        # Windows Bluetooth control via script is notoriously difficult.
+        # Often requires interacting with complex WinRT APIs or third-party libraries.
+        # No simple command-line equivalent like netsh for Wi-Fi.
+        return "Error: Bluetooth toggle is not reliably supported via script on Windows."
+    else:
+        return f"Error: Bluetooth toggle not supported on this platform ({sys.platform})."
+
+    # Fallback message if no platform matched or specific logic failed
+    # return f"Bluetooth toggle {state} - Platform specific implementation needed."
+
+
+def get_cpu_usage() -> str:
+    """Gets the current CPU usage percentage."""
+    if psutil:
+        try:
+            # interval=0.1 gives a short sample time for a more instant reading
+            usage = psutil.cpu_percent(interval=0.1)
+            return f"CPU Usage: {usage}%"
+        except Exception as e:
+            return f"Error getting CPU usage: {e}"
+    return "Error: psutil library missing or failed to initialize."
+
+def get_memory_usage() -> str:
+    """Gets the current virtual memory usage percentage."""
+    if psutil:
+        try:
+            memory = psutil.virtual_memory()
+            return f"Memory Usage: {memory.percent:.1f}%"
+        except Exception as e:
+            return f"Error getting memory usage: {e}"
+    return "Error: psutil library missing or failed to initialize."
+
+# --- Volume Control (Platform Specific) ---
+
+async def set_volume(level: int) -> str:
+    """Sets the system master volume.
+
+    Args:
+        level: Volume level percentage (0-100).
+
+    Returns:
+        Status message or error.
+    """
+    if not 0 <= level <= 100:
+        return "Error: Volume level must be between 0 and 100."
+
+    try:
+        if sys.platform == 'win32':
+            if not AudioUtilities:
+                 return "Error: pycaw library missing for Windows volume control."
+            # This part is synchronous, wrap in executor for async context
+            def _set_win_volume():
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = interface.QueryInterface(IAudioEndpointVolume)
+                # Volume scalar range is 0.0 to 1.0
+                volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _set_win_volume) # Runs sync code in thread pool
+            return f"Volume set to {level}% on Windows."
+
+        elif sys.platform == 'darwin': # macOS
+            command = f"osascript -e 'set volume output volume {level}'"
+            result = await _run_command(command)
+            if result is not None:
+                return f"Volume set to {level}% on macOS."
+            else:
+                return f"Error setting volume on macOS. Command: '{command}'"
+
+        elif sys.platform.startswith('linux'):
+            # Assumes 'amixer' is installed (usually part of alsa-utils)
+            # Finds the default 'Master' control. Might need adjustment based on system config.
+            command = f"amixer sset Master {level}%"
+            # Alternative using pactl (PulseAudio): command = f"pactl set-sink-volume @DEFAULT_SINK@ {level}%"
+            result = await _run_command(command)
+            if result is not None:
+                 return f"Volume set to {level}% on Linux (using amixer)."
+            else:
+                 return f"Error setting volume on Linux. Command: '{command}'. Is 'amixer' installed and configured?"
+        else:
+            return f"Error: Volume control not supported on this platform ({sys.platform})."
+    except Exception as e:
+        return f"An unexpected error occurred setting volume: {e}"
+
+
+async def get_volume() -> str:
+    """Gets the current system master volume."""
+    try:
+        if sys.platform == 'win32':
+            if not AudioUtilities:
+                 return "Error: pycaw library missing for Windows volume control."
+            # This part is synchronous, wrap in executor for async context
+            def _get_win_volume():
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = interface.QueryInterface(IAudioEndpointVolume)
+                # Volume scalar range is 0.0 to 1.0
+                level = int(volume.GetMasterVolumeLevelScalar() * 100)
+                return level
+            loop = asyncio.get_running_loop()
+            level = await loop.run_in_executor(None, _get_win_volume)
+            return f"Current Volume: {level}% (Windows)"
+
+        elif sys.platform == 'darwin': # macOS
+            command = "osascript -e 'output volume of (get volume settings)'"
+            result = await _run_command(command)
+            if result and result.isdigit():
+                return f"Current Volume: {result}% (macOS)"
+            else:
+                # Try getting muted status if volume fetch failed
+                muted_command = "osascript -e 'output muted of (get volume settings)'"
+                muted_result = await _run_command(muted_command)
+                if muted_result == 'true':
+                    return "Current Volume: Muted (macOS)"
+                return f"Error getting volume on macOS. Command: '{command}', Result: '{result}'"
+
+
+        elif sys.platform.startswith('linux'):
+            # Assumes 'amixer' is installed. Parses output like: "[80%] [-10.00dB] [on]"
+            command = "amixer sget Master"
+            result = await _run_command(command)
+            if result:
+                # Find the line with percentage volume
+                for line in result.split('\n'):
+                    if 'Playback' in line and '%' in line: # Common format line
+                        try:
+                            # Extract percentage value like [80%]
+                            level_str = line.split('[')[1].split('%]')[0]
+                            # Check if muted like [off]
+                            muted = '[off]' in line.lower()
+                            if muted:
+                                return f"Current Volume: Muted ({level_str}%) (Linux)"
+                            else:
+                                return f"Current Volume: {level_str}% (Linux)"
+                        except IndexError:
+                            continue # Try next line if parsing fails
+                return "Error: Could not parse volume from amixer output on Linux."
+            else:
+                return "Error getting volume on Linux. Command: '{command}'. Is 'amixer' installed?"
+        else:
+            return f"Error: Volume control not supported on this platform ({sys.platform})."
+
+    except Exception as e:
+        # Catch potential errors during volume retrieval (e.g., audio device issues)
+        return f"An unexpected error occurred getting volume: {e}"
+
+
+def get_battery_status() -> str:
+    """Gets battery percentage and charging status."""
+    if psutil:
+        try:
+            battery = psutil.sensors_battery()
+            if battery:
+                percent = int(battery.percent)
+                charging = battery.power_plugged
+                status_text = f"Battery: {percent}% ({'Charging' if charging else 'Discharging'})"
+                # Return as JSON string as in the original example
+                return json.dumps({
+                    "percent": percent,
+                    "charging": charging,
+                    "status_text": status_text
+                })
+            else:
+                return json.dumps({"error": "No battery detected."})
+        except NotImplementedError:
+             return json.dumps({"error": "Battery status not supported on this system according to psutil."})
+        except Exception as e:
+             return json.dumps({"error": f"Error getting battery status: {e}"})
+    return json.dumps({"error": "psutil library missing or failed to initialize."})
+
+
+# --- Shell Command Executor (Updated success check) ---
+def execute_shell_command(command):
+    """
+    Executes a shell command string and captures output. Returns structured dict.
+    Success requires exit code 0 AND empty stderr.
+    🛑 SECURITY WARNING: Only use if ALLOW_SHELL_EXECUTION is true.
+    """
+    result_data = {
+        "command": command,
+        "success": False,
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "",
+        "error_message": None
+    }
+    if not ALLOW_SHELL_EXECUTION:
+        logging.warning(f"Blocked attempt to execute shell command (disabled): {command}")
+        result_data["error_message"] = "Shell command execution is disabled by server configuration."
+        return result_data
+
+    logging.warning(f"🛑 EXECUTING SHELL COMMAND: {command}")
+    try:
+        result = subprocess.run(
+            command,
+            shell=True, # Necessary for complex commands, increases risk
+            capture_output=True,
+            text=True,
+            timeout=SHELL_COMMAND_TIMEOUT,
+            check=False
+        )
+        result_data["exit_code"] = result.returncode
+        result_data["stdout"] = result.stdout.strip() if result.stdout else ""
+        result_data["stderr"] = result.stderr.strip() if result.stderr else ""
+        # --- MODIFIED SUCCESS CHECK ---
+        # Success only if exit code is 0 AND stderr is empty
+        result_data["success"] = (result.returncode == 0 and not result.stderr)
+
+        if result_data["success"]:
+             logging.info(f"Shell command executed successfully. Exit Code: 0, Stderr: (empty)")
+        else:
+             logging.warning(f"Shell command failed. Success Criteria Failed (Exit Code: {result.returncode}, Stderr: '{result.stderr[:100]}...')") # Log snippet of stderr
+
+        return result_data
+
+    except subprocess.TimeoutExpired:
+        logging.error(f"Shell command timed out: {command}")
+        result_data["error_message"] = f"Command timed out after {SHELL_COMMAND_TIMEOUT} seconds."
+        result_data["success"] = False # Ensure success is false on timeout
+        return result_data
+    except Exception as e:
+        logging.exception(f"Error executing shell command '{command}': {e}")
+        result_data["error_message"] = f"Error executing shell command: {e}"
+        result_data["success"] = False # Ensure success is false on other exceptions
+        return result_data
+
+
+# --- Intent to Function Mapping (Unchanged) ---
+INTENT_HANDLERS = {
+    "set_brightness": set_brightness, "toggle_wifi": toggle_wifi, "toggle_bluetooth": toggle_bluetooth,
+    "get_cpu_usage": get_cpu_usage, "get_memory_usage": get_memory_usage,
+    "set_volume": set_volume, "get_volume": get_volume, "get_battery_status": get_battery_status,
+    "run_shell_command": execute_shell_command,
+}
+
 
 if __name__ == "__main__":
     try: asyncio.run(main())
