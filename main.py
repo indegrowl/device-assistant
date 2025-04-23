@@ -10,6 +10,9 @@ import collections # For deque (history)
 import shlex # For safely splitting command for Popen when shell=False
 import sys # To check platform
 
+import subprocess
+import screen_brightness_control as sbc
+
 # Attempt to import distro, optional dependency
 try:
     import distro
@@ -96,7 +99,7 @@ async def call_openai_api(command, history=None):
     if not openai_available or not client:
         return {"intent": "unknown", "parameters": {"error": "OpenAI interpretation is unavailable."}}
 
-    logging.info(f"Querying OpenAI API for: '{command}' with history and OS info.")
+    logging.info(f"Querying LLM for: '{command}' with history and OS info.")
 
     # --- Updated System Prompt ---
     run_shell_command_prompt = f"""
@@ -138,6 +141,7 @@ respond with: {{"intent": "unknown", "parameters": {{"error": "Command not under
     try:
         response = await client.chat.completions.create(
             model="o4-mini",
+            # model="gpt-4o",
             messages=messages,
             response_format={ "type": "json_object" }
         )
@@ -166,12 +170,17 @@ async def interpret_command_with_llm(command, history=None):
     """
     logging.info(f"Interpreting command: '{command}'")
     command_lower = command.lower()
+    cl = command.lower()
     interpretation = None
     # --- 1. Hardcoded Rules ---
     if command_lower == "get cpu usage": interpretation = {"intent": "get_cpu_usage", "parameters": {}}
     elif command_lower == "get memory usage": interpretation = {"intent": "get_memory_usage", "parameters": {}}
     elif command_lower == "get_volume": interpretation = {"intent": "get_volume", "parameters": {}}
     elif command_lower == "get_battery_status": interpretation = {"intent": "get_battery_status", "parameters": {}}
+    elif "wifi" in cl and "status" in cl:
+        interpretation = {"intent": "get_wifi_status", "parameters": {}}
+    elif "bluetooth" in cl and "status" in cl:
+        interpretation = {"intent": "get_bluetooth_status", "parameters": {}}
     elif "brightness" in command_lower: # ... (brightness logic)
         level = None; words = command_lower.split(); # ... find level ...
         if level is not None: interpretation = {"intent": "set_brightness", "parameters": {"level": max(0, min(100, level))}}
@@ -308,27 +317,97 @@ async def _run_command(command):
         return None
     return stdout.decode().strip()
 
+
+# ——— New: status queries —————————————————————————————————————
+async def get_wifi_status() -> str:
+    # Run the command; _run_command returns a single string (or None)
+    if sys.platform.startswith("linux"):
+        result = await _run_command("nmcli radio wifi")
+        state = result.lower().strip() if result else "unknown"
+
+    elif sys.platform == "darwin":
+        # get device identifier
+        dev = await _run_command(
+            "networksetup -listallhardwareports | awk '/Hardware Port: Wi-Fi/{getline; print $2}'"
+        )
+        out = await _run_command(f"networksetup -getairportpower {dev}")
+        state = "on" if out and "On" in out else "off"
+
+    elif sys.platform == "win32":
+        out = await _run_command(
+            'netsh interface show interface name="Wi-Fi"'
+        )
+        state = "on" if out and "Connected" in out else "off"
+
+    else:
+        state = "unknown"
+
+    return f"Wi‑Fi Status: {state}"
+
+
+async def get_bluetooth_status() -> str:
+    if sys.platform.startswith("linux"):
+        out = await _run_command("rfkill list bluetooth")
+        state = "off" if out and "Soft blocked: yes" in out else "on"
+
+    elif sys.platform == "darwin":
+        out = await _run_command("blueutil --power")
+        # blueutil returns "1" or "0"
+        state = "on" if out == "1" else "off"
+
+    else:
+        state = "unsupported"
+
+    return f"Bluetooth Status: {state}"
+
+
 # --- Device Control Functions ---
 
+# def set_brightness(level: int) -> str:
+#     """Sets the screen brightness.
+
+#     Args:
+#         level: Brightness level percentage (0-100).
+
+#     Returns:
+#         Status message or error.
+#     """
+#     if not sbc:
+#         return "Error: screen-brightness-control library missing."
+#     if not 0 <= level <= 100:
+#         return "Error: Brightness level must be between 0 and 100."
+#     try:
+#         sbc.set_brightness(level)
+#         return f"Brightness set to {level}%"
+#     except Exception as e:
+#         return f"Error setting brightness: {e}"
 def set_brightness(level: int) -> str:
-    """Sets the screen brightness.
-
-    Args:
-        level: Brightness level percentage (0-100).
-
-    Returns:
-        Status message or error.
-    """
-    if not sbc:
-        return "Error: screen-brightness-control library missing."
+    """Sets the screen brightness."""
+    # Validate
     if not 0 <= level <= 100:
         return "Error: Brightness level must be between 0 and 100."
+    
     try:
-        sbc.set_brightness(level)
-        return f"Brightness set to {level}%"
+        if sys.platform == 'darwin':  # macOS
+            try:
+                # Use the brightness Python package instead of CLI or AppleScript
+                import brightness_control  # Import at function call time
+                brightness_control.set_brightness(level)
+                return f"Brightness set to {level}% on macOS using brightness-control package."
+            except ImportError:
+                # Try direct subprocess approach
+                normalized = level / 100.0
+                subprocess.run(['brightness', f'{normalized}'], check=True)
+                return f"Brightness set to {level}% on macOS via brightness command."
+        
+        # Existing cross-platform logic for non-macOS
+        if sbc:
+            sbc.set_brightness(level)
+            return f"Brightness set to {level}%"
+        else:
+            return "Error: screen-brightness-control library missing."
     except Exception as e:
         return f"Error setting brightness: {e}"
-
 async def toggle_wifi(state: str) -> str:
     """Toggles Wi-Fi state (on/off). Highly platform-dependent.
 
@@ -670,6 +749,8 @@ INTENT_HANDLERS = {
     "get_cpu_usage": get_cpu_usage, "get_memory_usage": get_memory_usage,
     "set_volume": set_volume, "get_volume": get_volume, "get_battery_status": get_battery_status,
     "run_shell_command": execute_shell_command,
+    "get_wifi_status": get_wifi_status,
+    "get_bluetooth_status": get_bluetooth_status,
 }
 
 
